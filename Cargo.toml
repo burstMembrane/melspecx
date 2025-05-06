@@ -1,0 +1,39 @@
+[package]
+name = "melspecx"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "melspecx"
+path = "src/lib.rs"
+crate-type = ["cdylib", "lib"]
+
+
+[features]
+default = ["python-bindings"]
+python-bindings = ["pyo3"]
+
+[dependencies]
+byteorder = "1.5.0"
+hound = "3.5.1"
+memmap2 = "0.9.5"
+numpy = { version = "0.24.0", optional = true }
+pyo3 = { version = "0.24.2", features = ["extension-module"], optional = true }
+rayon = "1.10.0"
+image = "0.24.7"
+ndarray = "0.16.1"
+soundkit = "0.12.1"
+itertools = "0.12.0"
+num = "0.4.3"
+colorgrad = "0.7.1"
+wgpu = "24.0.3"
+gpu-fft = "0.0.2"
+bytemuck = "1.23.0"
+cubecl = { version = "0.4.0", features = ["wgpu"] }
+cubecl-wgpu = "0.4.0"
+rubato = "0.16.2"
+
+[dev-dependencies]
+clap = "4.5.37"
+clio = { version = "0.3.5", features = ["clap-parse"] }
