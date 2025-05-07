@@ -1,8 +1,28 @@
 use crate::colors;
-use cubecl;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+static GPU_DEVICE: Lazy<WgpuDevice> = Lazy::new(|| Default::default());
+static FILTERBANKS: Lazy<HashMap<(usize, u32, usize), Array2<f32>>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+    let n_fft = 1024;
+    let n_freqs = n_fft / 2 + 1;
+    for &sample_rate in &[44100.0f32, 22050.0, 16000.0, 8000.0] {
+        let f_min = 0.0;
+        let f_max = sample_rate / 2.0;
+        for &n_mels in &[96usize, 128usize] {
+            let fbanks = mel_filter_bank(n_freqs, f_min, f_max, n_mels, sample_rate);
+            let fbanks_flat: Vec<f32> = fbanks.into_iter().flatten().collect();
+            let arr = Array2::from_shape_vec((n_mels, n_freqs), fbanks_flat).unwrap();
+            m.insert((n_fft, sample_rate as u32, n_mels), arr);
+        }
+    }
+    m
+});
+use cubecl::wgpu::WgpuDevice;
 use gpu_fft::fft::fft as gpu_fft_fft;
 use image::ImageBuffer;
 use image::Rgb;
+use ndarray::Array2;
 use num::complex::Complex;
 use std::time::Instant;
 
@@ -37,10 +57,10 @@ pub fn mel_spec_from_path(
     let start_time = Instant::now();
     let cmap = colors::Colormap::from_name(&colormap).unwrap();
     let (audio, sr) = read_wav(path, Some(true)).unwrap();
-    print!("Audio read time: {:?}", start_time.elapsed());
+    println!("Audio read time: {:?}", start_time.elapsed());
     let start_time = Instant::now();
     let mel_spec = mel_spectrogram_db(
-        MelConfig::new(
+        &MelConfig::new(
             sr as f32,
             n_fft,
             win_length,
@@ -53,11 +73,17 @@ pub fn mel_spec_from_path(
         ),
         audio,
     );
-    let duration = start_time.elapsed();
-    println!("Mel spectrogram generation time: {:?}", duration);
+    println!(
+        "Mel spectrogram generation time: {:?}",
+        start_time.elapsed()
+    );
 
+    let start_time = Instant::now();
     let image = plot_mel_spec(mel_spec, cmap, width_px, height_px);
-    Python::with_gil(|py| {
+    println!("Plotting time: {:?}", start_time.elapsed());
+
+    let start_time = Instant::now();
+    let result = Python::with_gil(|py| {
         // Convert image to PNG bytes
         let mut buffer = Cursor::new(Vec::new());
         match image.write_to(&mut buffer, image::ImageFormat::Png) {
@@ -71,7 +97,9 @@ pub fn mel_spec_from_path(
                 e
             ))),
         }
-    })
+    });
+    println!("Image encoding time: {:?}", start_time.elapsed());
+    result
 }
 
 fn gpu_spectrogram(
@@ -81,22 +109,56 @@ fn gpu_spectrogram(
     _hop_length: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
-    let device: <Runtime as cubecl::Runtime>::Device = Default::default();
+    let start_time = Instant::now();
 
-    let mut spec = Vec::new();
-    for chunk in waveform.chunks(n_fft) {
-        let mut frame = vec![0.0f32; n_fft];
-        frame[..chunk.len()].copy_from_slice(chunk);
-        let (real, imag) = gpu_fft_fft::<Runtime>(&device, frame);
-        let half = if onesided { n_fft / 2 + 1 } else { n_fft };
-        let mut mags = Vec::with_capacity(half);
-        for i in 0..half {
-            mags.push((real[i].powi(2) + imag[i].powi(2)).sqrt());
-        }
-        spec.push(mags);
-    }
+    let device = (*GPU_DEVICE).clone();
+
+    println!("CubeCL WGPU device initialized");
+    println!("Using device type: WGPU");
+    println!("GPU device initialization time: {:?}", start_time.elapsed());
+
+    let start_time = Instant::now();
+    let chunk_size = n_fft * 2;
+
+    // Precompute all padded frames
+    let frames: Vec<Vec<f32>> = waveform
+        .chunks(chunk_size)
+        .map(|chunk| {
+            let mut frame = vec![0.0f32; chunk_size];
+            frame[..chunk.len()].copy_from_slice(chunk);
+            frame
+        })
+        .collect();
+
+    let total_ffts = frames.len();
+    let fft_start = Instant::now();
+    let spec: Vec<Vec<f32>> = frames
+        .into_par_iter()
+        .map(|frame| {
+            let (real, imag) = gpu_fft_fft::<Runtime>(&device, frame);
+            let half = if onesided { n_fft / 2 + 1 } else { n_fft };
+            (0..half)
+                .map(|i| (real[i].powi(2) + imag[i].powi(2)).sqrt())
+                .collect()
+        })
+        .collect();
+    let fft_time = fft_start.elapsed();
+
+    let chunks_processing_time = start_time.elapsed();
+    println!(
+        "GPU spectrogram total processing time: {:?}",
+        chunks_processing_time
+    );
+    println!(
+        "Average FFT time: {:?}",
+        fft_time.div_f32(total_ffts as f32)
+    );
+    println!("Total FFT operations: {}", total_ffts);
+    println!("GPU spectrogram chunks count: {}", waveform.len() / n_fft);
+    println!("GPU spectrogram time: {:?}", start_time.elapsed());
     spec
 }
+
 #[derive(Clone)]
 #[cfg_attr(feature = "python-bindings", derive(IntoPyObject, IntoPyObjectRef))]
 pub struct SpectrogramConfig {
@@ -153,13 +215,18 @@ impl MelConfig {
         }
     }
 }
-pub fn mel_spectrogram_db(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
-    let top_db = config.top_db;
+pub fn mel_spectrogram_db(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
+    let start_time = Instant::now();
     let mel_spec: Vec<Vec<f32>> = mel_spectrogram(config, waveform);
-    amplitude_to_db(mel_spec, top_db)
+    println!(
+        "Mel spectrogram computation time: {:?}",
+        start_time.elapsed()
+    );
+    mel_spec
 }
 
-fn mel_spectrogram(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
+fn mel_spectrogram(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
+    let start_time = Instant::now();
     let spectrogram = spectrogram(
         waveform,
         config.n_fft,
@@ -167,29 +234,45 @@ fn mel_spectrogram(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
         config.hop_length,
         config.spectrogram_config.onesided,
     );
-    let n_freqs = spectrogram[0].len();
-    let fbanks = mel_filter_bank(
-        n_freqs,
-        config.f_min,
-        config.f_max,
-        config.n_mels,
-        config.sample_rate,
-    );
+    println!("Spectrogram generation time: {:?}", start_time.elapsed());
 
-    spectrogram
-        .into_par_iter()
-        .map(|spec_row| {
-            (0..config.n_mels)
-                .map(|j| {
-                    spec_row
-                        .iter()
-                        .zip(fbanks.iter())
-                        .map(|(&s, fbank)| s * fbank[j])
-                        .sum()
-                })
-                .collect()
-        })
-        .collect()
+    let start_time = Instant::now();
+    let frames = spectrogram.len();
+    let n_freqs = spectrogram[0].len();
+    let spec_flat: Vec<f32> = spectrogram.into_iter().flatten().collect();
+    let spec_arr = Array2::from_shape_vec((frames, n_freqs), spec_flat).unwrap();
+
+    // Use cached filterbank if available, otherwise compute dynamically
+    let fbanks_arr: Array2<f32> = if let Some(arr) =
+        FILTERBANKS.get(&(config.n_fft, config.sample_rate as u32, config.n_mels))
+    {
+        arr.clone()
+    } else {
+        let n_freqs = config.n_fft / 2 + 1;
+        let fbanks = mel_filter_bank(
+            n_freqs,
+            config.f_min,
+            config.f_max,
+            config.n_mels,
+            config.sample_rate,
+        );
+        let fbanks_flat: Vec<f32> = fbanks.into_iter().flatten().collect();
+        Array2::from_shape_vec((config.n_mels, n_freqs), fbanks_flat).unwrap()
+    };
+    let mel_arr = spec_arr.dot(&fbanks_arr.t());
+
+    // Fuse amplitude→dB conversion
+    let epsilon = 1e-10f32;
+    let result: Vec<Vec<f32>> = mel_arr
+        .mapv(|x| 20.0 * x.max(epsilon).log10())
+        .outer_iter()
+        .map(|row| row.to_vec())
+        .collect();
+    println!(
+        "Mel filtering + dB conversion time: {:?}",
+        start_time.elapsed()
+    );
+    result
 }
 
 fn spectrogram(
@@ -199,8 +282,14 @@ fn spectrogram(
     hop_length: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
+    let start_time = Instant::now();
     // GPU-accelerated FFT
-    gpu_spectrogram(waveform, n_fft, win_length, hop_length, onesided)
+    let result = gpu_spectrogram(waveform, n_fft, win_length, hop_length, onesided);
+    println!(
+        "Total spectrogram function time: {:?}",
+        start_time.elapsed()
+    );
+    result
 }
 
 // we might reimplement this in the future
@@ -455,50 +544,16 @@ fn _assert_complex_eq(left: Complex<f32>, right: Complex<f32>) {
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use num::complex::Complex;
-
-    #[test]
-    fn test_fft_constant() {
-        let input = vec![1.0, 0.0, 0.0, 0.0]; // Changed to real input
-        let output = fft(input, 4);
-        _assert_complex_eq(output[0], Complex::new(1.0, 0.0));
-        _assert_complex_eq(output[1], Complex::new(1.0, 0.0));
-        _assert_complex_eq(output[2], Complex::new(1.0, 0.0));
-        _assert_complex_eq(output[3], Complex::new(1.0, 0.0));
-    }
-
-    #[test]
-    fn test_fft_basic() {
-        let input = vec![1.0, 2.0, 3.0, 4.0]; // Changed to real input
-        let output = fft(input, 4);
-        _assert_complex_eq(output[0], Complex::new(10.0, 0.0));
-        _assert_complex_eq(output[1], Complex::new(-2.0, 2.0));
-        _assert_complex_eq(output[2], Complex::new(-2.0, 0.0));
-        _assert_complex_eq(output[3], Complex::new(-2.0, -2.0));
-    }
-
-    #[test]
-    fn test_fft_with_length_eight() {
-        let input = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]; // Changed to real input
-        let output = fft(input, 8);
-        _assert_complex_eq(output[0], Complex::new(10.0, 0.0));
-        _assert_complex_eq(output[1], Complex::new(-0.41421356, -7.24264069));
-        _assert_complex_eq(output[2], Complex::new(-2.0, 2.0));
-        _assert_complex_eq(output[3], Complex::new(2.41421356, -1.24264069));
-        _assert_complex_eq(output[4], Complex::new(-2.0, 0.0));
-        _assert_complex_eq(output[5], Complex::new(2.41421356, 1.24264069));
-        _assert_complex_eq(output[6], Complex::new(-2.0, -2.0));
-        _assert_complex_eq(output[7], Complex::new(-0.41421356, 7.24264069));
-    }
-}
-
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
 pub fn mel_spectrogram_db_py(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
-    mel_spectrogram_db(config, waveform)
+    let start_time = Instant::now();
+    let result = mel_spectrogram_db(&config, waveform);
+    println!(
+        "mel_spectrogram_db_py execution time: {:?}",
+        start_time.elapsed()
+    );
+    result
 }
 
 #[cfg(feature = "python-bindings")]
@@ -509,8 +564,12 @@ pub fn plot_mel_spec_py(
     width_px: u32,
     height_px: u32,
 ) -> PyResult<Py<PyAny>> {
+    let start_time = Instant::now();
     let image = plot_mel_spec(mel_spec, cmap, width_px, height_px);
-    Python::with_gil(|py| {
+    println!("plot_mel_spec_py plotting time: {:?}", start_time.elapsed());
+
+    let start_time_encoding = Instant::now();
+    let result = Python::with_gil(|py| {
         // Convert image to PNG bytes
         let mut buffer = Cursor::new(Vec::new());
         match image.write_to(&mut buffer, image::ImageFormat::Png) {
@@ -524,7 +583,13 @@ pub fn plot_mel_spec_py(
                 e
             ))),
         }
-    })
+    });
+    println!(
+        "plot_mel_spec_py encoding time: {:?}",
+        start_time_encoding.elapsed()
+    );
+    println!("plot_mel_spec_py total time: {:?}", start_time.elapsed());
+    result
 }
 
 #[cfg(feature = "python-bindings")]
@@ -540,9 +605,10 @@ pub fn create_mel_config(
     top_db: f32,
     onesided: Option<bool>,
 ) -> MelConfig {
+    let start_time = Instant::now();
     let spectrogram_config = SpectrogramConfig::new(onesided.unwrap_or(true));
 
-    MelConfig::new(
+    let result = MelConfig::new(
         sample_rate,
         n_fft,
         win_length,
@@ -552,7 +618,12 @@ pub fn create_mel_config(
         n_mels,
         top_db,
         spectrogram_config,
-    )
+    );
+    println!(
+        "create_mel_config execution time: {:?}",
+        start_time.elapsed()
+    );
+    result
 }
 
 // Add implementation for MelConfig to convert from Python objects
@@ -611,5 +682,45 @@ impl<'py> IntoPyObject<'py> for MelConfig {
 
         let dict_any = dict.into_pyobject(py)?.into_any();
         Ok(dict_any)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num::complex::Complex;
+
+    #[test]
+    fn test_fft_constant() {
+        let input = vec![1.0, 0.0, 0.0, 0.0]; // Changed to real input
+        let output = fft(input, 4);
+        _assert_complex_eq(output[0], Complex::new(1.0, 0.0));
+        _assert_complex_eq(output[1], Complex::new(1.0, 0.0));
+        _assert_complex_eq(output[2], Complex::new(1.0, 0.0));
+        _assert_complex_eq(output[3], Complex::new(1.0, 0.0));
+    }
+
+    #[test]
+    fn test_fft_basic() {
+        let input = vec![1.0, 2.0, 3.0, 4.0]; // Changed to real input
+        let output = fft(input, 4);
+        _assert_complex_eq(output[0], Complex::new(10.0, 0.0));
+        _assert_complex_eq(output[1], Complex::new(-2.0, 2.0));
+        _assert_complex_eq(output[2], Complex::new(-2.0, 0.0));
+        _assert_complex_eq(output[3], Complex::new(-2.0, -2.0));
+    }
+
+    #[test]
+    fn test_fft_with_length_eight() {
+        let input = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]; // Changed to real input
+        let output = fft(input, 8);
+        _assert_complex_eq(output[0], Complex::new(10.0, 0.0));
+        _assert_complex_eq(output[1], Complex::new(-0.41421356, -7.24264069));
+        _assert_complex_eq(output[2], Complex::new(-2.0, 2.0));
+        _assert_complex_eq(output[3], Complex::new(2.41421356, -1.24264069));
+        _assert_complex_eq(output[4], Complex::new(-2.0, 0.0));
+        _assert_complex_eq(output[5], Complex::new(2.41421356, 1.24264069));
+        _assert_complex_eq(output[6], Complex::new(-2.0, -2.0));
+        _assert_complex_eq(output[7], Complex::new(-0.41421356, 7.24264069));
     }
 }
