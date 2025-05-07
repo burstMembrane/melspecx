@@ -1,7 +1,9 @@
 // from https://github.com/eugenehp/gpu-fft/blob/master/src/fft.rs
 use cubecl::prelude::*;
-use std::f32::consts::PI;
+use once_cell::sync::OnceCell;
 
+use std::f32::consts::PI;
+static FFT_PRELOADED: OnceCell<()> = OnceCell::new();
 // The general advice for WebGPU is to choose a workgroup size of 64
 // Common sizes are 32, 64, 128, 256, or 512 threads per workgroup.
 // Apple Metal supports a maximum workgroup size of 1024 threads.
@@ -122,7 +124,26 @@ pub fn fft_batched<R: Runtime>(
 
     results
 }
+pub fn preload_fft_kernel<R: Runtime>(device: &R::Device, n: usize) {
+    let client = R::client(device);
 
+    let dummy_input = vec![0.0f32; n];
+    let input_handle = client.create(f32::as_bytes(&dummy_input));
+    let output_handle = client.empty(n * 2 * std::mem::size_of::<f32>());
+
+    let num_workgroups = (n as u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+    unsafe {
+        fft_kernel::launch::<f32, R>(
+            &client,
+            CubeCount::Static(num_workgroups, 1, 1),
+            CubeDim::new(WORKGROUP_SIZE, 1, 1),
+            ArrayArg::from_raw_parts::<f32>(&input_handle, n, 1),
+            ArrayArg::from_raw_parts::<f32>(&output_handle, n * 2, 1),
+            n as u32,
+        );
+    }
+}
 /// Computes the Fast Fourier Transform (FFT) of a vector of f32 input data.
 ///
 /// This function initializes the FFT computation on the provided input vector, launching
@@ -155,6 +176,10 @@ pub fn fft_batched<R: Runtime>(
 pub fn fft<R: Runtime>(device: &R::Device, input: Vec<f32>) -> (Vec<f32>, Vec<f32>) {
     let client = R::client(device);
     let n = input.len();
+
+    FFT_PRELOADED.get_or_init(|| {
+        preload_fft_kernel::<R>(device, n);
+    });
 
     let input_handle = client.create(f32::as_bytes(&input));
     let output_handle = client.empty(n * 2 * core::mem::size_of::<f32>()); // Adjust for interleaved output
@@ -191,4 +216,48 @@ pub fn fft<R: Runtime>(device: &R::Device, input: Vec<f32>) -> (Vec<f32>, Vec<f3
     // );
 
     (real, imag)
+}
+
+use std::sync::Arc;
+
+pub struct FftBatcher<R: Runtime> {
+    buffer: Vec<Vec<f32>>,
+    device: Arc<R::Device>,
+    n: usize,
+    capacity: usize,
+}
+
+impl<R: Runtime> FftBatcher<R> {
+    pub fn new(device: Arc<R::Device>, n: usize, capacity: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+            device,
+            n,
+            capacity,
+        }
+    }
+
+    /// Push a new frame into the batcher. Returns Some(results) when the buffer reaches capacity.
+    pub fn push(&mut self, frame: Vec<f32>) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
+        assert_eq!(frame.len(), self.n, "Frame size mismatch");
+        self.buffer.push(frame);
+        if self.buffer.len() == self.capacity {
+            let results = fft_batched::<R>(&self.device, &self.buffer);
+            self.buffer.clear();
+            Some(results)
+        } else {
+            None
+        }
+    }
+
+    /// Force flush the current buffer if it's not empty.
+    pub fn flush(&mut self) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
+        if self.buffer.is_empty() {
+            None
+        } else {
+            let results = fft_batched::<R>(&self.device, &self.buffer);
+            self.buffer.clear();
+            Some(results)
+        }
+    }
 }
