@@ -1,6 +1,7 @@
 use crate::colors;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+
 static GPU_DEVICE: Lazy<WgpuDevice> = Lazy::new(|| Default::default());
 static FILTERBANKS: Lazy<HashMap<(usize, u32, usize), Array2<f32>>> = Lazy::new(|| {
     let mut m = HashMap::new();
@@ -18,8 +19,8 @@ static FILTERBANKS: Lazy<HashMap<(usize, u32, usize), Array2<f32>>> = Lazy::new(
     }
     m
 });
+use crate::fft::fft;
 use cubecl::wgpu::WgpuDevice;
-use gpu_fft::fft::fft as gpu_fft_fft;
 use image::ImageBuffer;
 use image::Rgb;
 use ndarray::Array2;
@@ -110,8 +111,7 @@ fn gpu_spectrogram(
     onesided: bool,
 ) -> Vec<Vec<f32>> {
     let start_time = Instant::now();
-
-    let device = (*GPU_DEVICE).clone();
+    let device = &*GPU_DEVICE;
 
     println!("CubeCL WGPU device initialized");
     println!("Using device type: WGPU");
@@ -122,37 +122,39 @@ fn gpu_spectrogram(
 
     // Precompute all padded frames
     let frames: Vec<Vec<f32>> = waveform
-        .chunks(chunk_size)
+        .par_chunks(chunk_size)
         .map(|chunk| {
             let mut frame = vec![0.0f32; chunk_size];
             frame[..chunk.len()].copy_from_slice(chunk);
             frame
         })
         .collect();
+    println!("Frame computation time: {:?}", start_time.elapsed());
 
     let total_ffts = frames.len();
     let fft_start = Instant::now();
+
     let spec: Vec<Vec<f32>> = frames
         .into_par_iter()
         .map(|frame| {
-            let (real, imag) = gpu_fft_fft::<Runtime>(&device, frame);
+            let (real, imag) = fft::<Runtime>(device, frame);
             let half = if onesided { n_fft / 2 + 1 } else { n_fft };
             (0..half)
                 .map(|i| (real[i].powi(2) + imag[i].powi(2)).sqrt())
                 .collect()
         })
         .collect();
-    let fft_time = fft_start.elapsed();
 
-    let chunks_processing_time = start_time.elapsed();
+    let fft_time = fft_start.elapsed();
     println!(
         "GPU spectrogram total processing time: {:?}",
-        chunks_processing_time
+        start_time.elapsed()
     );
     println!(
         "Average FFT time: {:?}",
         fft_time.div_f32(total_ffts as f32)
     );
+
     println!("Total FFT operations: {}", total_ffts);
     println!("GPU spectrogram chunks count: {}", waveform.len() / n_fft);
     println!("GPU spectrogram time: {:?}", start_time.elapsed());
@@ -290,52 +292,6 @@ fn spectrogram(
         start_time.elapsed()
     );
     result
-}
-
-// we might reimplement this in the future
-#[allow(dead_code)]
-fn fft(input: Vec<f32>, n_fft: usize) -> Vec<Complex<f32>> {
-    let num_samples = input.len();
-    assert!(n_fft.is_power_of_two(), "n_fft must be a power of 2");
-    assert!(
-        num_samples <= n_fft,
-        "n must be less than or equal to n_fft"
-    );
-
-    if num_samples <= 1 {
-        return input.into_iter().map(|x| Complex::new(x, 0.0)).collect();
-    }
-
-    let padded_input = if num_samples < n_fft {
-        let padding = vec![0.0; n_fft - num_samples];
-        input.clone().into_iter().chain(padding).collect()
-    } else {
-        input.clone()
-    };
-
-    // Split into even and odd parts
-    let even: Vec<f32> = padded_input.iter().step_by(2).cloned().collect();
-    let odd: Vec<f32> = padded_input.iter().skip(1).step_by(2).cloned().collect();
-
-    // Recursive FFT on even and odd parts
-    let even_fft = fft(even, n_fft / 2);
-    let odd_fft = fft(odd, n_fft / 2);
-
-    // Combine results
-    let mut output = vec![Complex::new(0.0, 0.0); n_fft];
-    for k in 0..(n_fft / 2) {
-        let t = odd_fft[k]
-            * Complex::from_polar(1.0, -2.0 * std::f32::consts::PI * k as f32 / n_fft as f32);
-        output[k] = even_fft[k] + t;
-        output[k + n_fft / 2] = even_fft[k] - t; // Exploit symmetry
-    }
-    output
-}
-#[allow(dead_code)]
-fn hann_window(length: usize) -> Vec<f32> {
-    (0..length)
-        .map(|n| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * n as f32 / (length - 1) as f32).cos()))
-        .collect()
 }
 
 fn mel_filter_bank(
@@ -502,31 +458,6 @@ pub fn plot_mel_spec(
     image
 }
 
-fn amplitude_to_db(amplitudes: Vec<Vec<f32>>, top_db: f32) -> Vec<Vec<f32>> {
-    use rayon::prelude::*;
-    let dbs: Vec<Vec<f32>> = amplitudes
-        .into_par_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|amp| 20.0 * amp.max(1e-10).log10())
-                .collect()
-        })
-        .collect();
-
-    let max_db = dbs
-        .iter()
-        .flat_map(|row| row.iter())
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
-
-    let clipped: Vec<Vec<f32>> = dbs
-        .into_par_iter()
-        .map(|row| row.into_iter().map(|db| db.max(max_db - top_db)).collect())
-        .collect();
-
-    clipped
-}
-
 fn _assert_complex_eq(left: Complex<f32>, right: Complex<f32>) {
     // tolerance for floating-point comparison
     const EPSILON: f32 = 1e-5;
@@ -682,45 +613,5 @@ impl<'py> IntoPyObject<'py> for MelConfig {
 
         let dict_any = dict.into_pyobject(py)?.into_any();
         Ok(dict_any)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use num::complex::Complex;
-
-    #[test]
-    fn test_fft_constant() {
-        let input = vec![1.0, 0.0, 0.0, 0.0]; // Changed to real input
-        let output = fft(input, 4);
-        _assert_complex_eq(output[0], Complex::new(1.0, 0.0));
-        _assert_complex_eq(output[1], Complex::new(1.0, 0.0));
-        _assert_complex_eq(output[2], Complex::new(1.0, 0.0));
-        _assert_complex_eq(output[3], Complex::new(1.0, 0.0));
-    }
-
-    #[test]
-    fn test_fft_basic() {
-        let input = vec![1.0, 2.0, 3.0, 4.0]; // Changed to real input
-        let output = fft(input, 4);
-        _assert_complex_eq(output[0], Complex::new(10.0, 0.0));
-        _assert_complex_eq(output[1], Complex::new(-2.0, 2.0));
-        _assert_complex_eq(output[2], Complex::new(-2.0, 0.0));
-        _assert_complex_eq(output[3], Complex::new(-2.0, -2.0));
-    }
-
-    #[test]
-    fn test_fft_with_length_eight() {
-        let input = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]; // Changed to real input
-        let output = fft(input, 8);
-        _assert_complex_eq(output[0], Complex::new(10.0, 0.0));
-        _assert_complex_eq(output[1], Complex::new(-0.41421356, -7.24264069));
-        _assert_complex_eq(output[2], Complex::new(-2.0, 2.0));
-        _assert_complex_eq(output[3], Complex::new(2.41421356, -1.24264069));
-        _assert_complex_eq(output[4], Complex::new(-2.0, 0.0));
-        _assert_complex_eq(output[5], Complex::new(2.41421356, 1.24264069));
-        _assert_complex_eq(output[6], Complex::new(-2.0, -2.0));
-        _assert_complex_eq(output[7], Complex::new(-0.41421356, 7.24264069));
     }
 }

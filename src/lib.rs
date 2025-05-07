@@ -4,8 +4,8 @@ use pyo3::prelude::*;
 pub mod audio;
 // pub mod bindings;
 pub mod colors;
+pub mod fft;
 pub mod mel;
-
 /// MelSpecX: Fast Mel Spectrogram Generation
 ///
 /// A Python module implemented in Rust for efficiently creating

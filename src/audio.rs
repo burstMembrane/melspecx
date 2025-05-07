@@ -112,6 +112,33 @@ fn read_samples(
     Ok(channel_samples)
 }
 
+pub fn generate_sine_wave(
+    frequency: f32,
+    duration: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Vec<f32> {
+    let mut audio_data = Vec::new();
+    let samples_per_channel = sample_rate * duration;
+
+    // Generate the base sine wave for one channel
+    let single_channel: Vec<f32> = (0..samples_per_channel)
+        .map(|x| x as f32 / sample_rate as f32)
+        .map(|t| {
+            let sample = (t * frequency * 2.0 * std::f32::consts::PI).sin();
+            sample * i16::MAX as f32
+        })
+        .collect();
+
+    // Duplicate the sine wave for each channel
+    for i in 0..samples_per_channel {
+        for _ in 0..channels {
+            audio_data.push(single_channel[i as usize]);
+        }
+    }
+    audio_data
+}
+
 fn _read_wav(path: &str) -> Result<(Vec<Vec<f32>>, usize), WavError> {
     let wav_reader = WavReader::open(path)?;
 
