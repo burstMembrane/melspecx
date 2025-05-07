@@ -7,7 +7,7 @@ use crate::fft::fft;
 use cubecl::wgpu::WgpuDevice;
 use image::ImageBuffer;
 use image::Rgb;
-
+use log::{debug, error, info, warn};
 use num::complex::Complex;
 use std::default::Default;
 use std::time::Instant;
@@ -62,12 +62,23 @@ pub fn mel_spec_from_path(
     top_db: f32,
     chunk_size: usize,
 ) -> PyResult<Py<PyAny>> {
-    // log start time to python
     let start_time = Instant::now();
-    let cmap = colors::Colormap::from_name(&colormap).unwrap();
-    let (audio, sr) = read_wav(path, Some(true)).unwrap();
-    println!("Audio read time: {:?}", start_time.elapsed());
+    let cmap = colors::Colormap::from_name(&colormap).ok_or_else(|| {
+        warn!("Invalid colormap name: {}", colormap);
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Invalid colormap name: {}",
+            colormap
+        ))
+    })?;
+
+    let (audio, sr) = read_wav(path, Some(true)).map_err(|e| {
+        error!("Failed to read WAV file: {}", e);
+        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read WAV file: {}", e))
+    })?;
+
+    info!("Audio read time: {:?}", start_time.elapsed());
     let start_time = Instant::now();
+
     let mel_spec = mel_spectrogram_db(
         &MelConfig::new(
             sr as f32,
@@ -83,32 +94,33 @@ pub fn mel_spec_from_path(
         ),
         audio,
     );
-    println!(
+    info!(
         "Mel spectrogram generation time: {:?}",
         start_time.elapsed()
     );
 
     let start_time = Instant::now();
     let image = plot_mel_spec(mel_spec, cmap, width_px, height_px);
-    println!("Plotting time: {:?}", start_time.elapsed());
+    info!("Plotting time: {:?}", start_time.elapsed());
 
     let start_time = Instant::now();
     let result = Python::with_gil(|py| {
-        // Convert image to PNG bytes
         let mut buffer = Cursor::new(Vec::new());
         match image.write_to(&mut buffer, image::ImageFormat::Png) {
             Ok(_) => {
-                // Convert to Python bytes object
                 let bytes = PyBytes::new(py, &buffer.into_inner());
                 Ok(bytes.into())
             }
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                "Failed to encode image: {}",
-                e
-            ))),
+            Err(e) => {
+                error!("Failed to encode image: {}", e);
+                Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to encode image: {}",
+                    e
+                )))
+            }
         }
     });
-    println!("Image encoding time: {:?}", start_time.elapsed());
+    info!("Image encoding time: {:?}", start_time.elapsed());
     result
 }
 fn gpu_spectrogram(
@@ -122,7 +134,6 @@ fn gpu_spectrogram(
     let start_time = Instant::now();
     let device = GPU_DEVICE.clone();
 
-    // Batch frames into chunks for efficient GPU processing
     let batched_input: Vec<Vec<f32>> = waveform
         .chunks(chunk_size)
         .map(|chunk| {
@@ -131,16 +142,14 @@ fn gpu_spectrogram(
             frame
         })
         .collect();
-    println!("Frame batching time: {:?}", start_time.elapsed());
+    debug!("Frame batching time: {:?}", start_time.elapsed());
 
-    // Process each chunk and collect results
     let fft_start = Instant::now();
     let half = if onesided { n_fft / 2 + 1 } else { n_fft };
 
     let spec: Vec<Vec<f32>> = batched_input
         .into_par_iter()
         .flat_map(|chunk| {
-            // Process each n_fft-sized window within the chunk
             chunk
                 .chunks(n_fft)
                 .map(|frame| {
@@ -158,9 +167,8 @@ fn gpu_spectrogram(
         .collect();
 
     let fft_time = fft_start.elapsed();
-
-    println!("GPU spectrogram total time: {:?}", start_time.elapsed());
-    println!("FFT compute time: {:?}", fft_time);
+    info!("GPU spectrogram total time: {:?}", start_time.elapsed());
+    debug!("FFT compute time: {:?}", fft_time);
 
     spec
 }
@@ -499,7 +507,7 @@ fn _assert_complex_eq(left: Complex<f32>, right: Complex<f32>) {
 pub fn mel_spectrogram_db_py(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
     let start_time = Instant::now();
     let result = mel_spectrogram_db(&config, waveform);
-    println!(
+    info!(
         "mel_spectrogram_db_py execution time: {:?}",
         start_time.elapsed()
     );
@@ -528,7 +536,7 @@ pub fn plot_mel_spec_py(
     use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     use image::ImageEncoder;
 
-    println!(
+    info!(
         "Starting plot_mel_spec_py with dimensions {}x{}",
         width_px, height_px
     );
@@ -536,52 +544,47 @@ pub fn plot_mel_spec_py(
 
     let image = plot_mel_spec(mel_spec, cmap, width_px, height_px);
     let plotting_time = start_time.elapsed();
-    println!("plot_mel_spec_py plotting time: {:?}", plotting_time);
+    info!("plot_mel_spec_py plotting time: {:?}", plotting_time);
 
     let start_time_encoding = Instant::now();
     let result = Python::with_gil(|py| {
-        println!(
+        debug!(
             "Starting PNG encoding with buffer size: {} bytes",
             (width_px * height_px * 3) as usize
         );
 
         let start_time_buffer = Instant::now();
-        // Pre-allocate buffer with estimated size
         let mut buffer = Vec::with_capacity((width_px * height_px * 3) as usize);
         let buffer_time = start_time_buffer.elapsed();
-        println!("Buffer allocation time: {:?}", buffer_time);
+        debug!("Buffer allocation time: {:?}", buffer_time);
 
-        // Use fast PNG encoding settings
-        let encoder = PngEncoder::new_with_quality(
-            &mut buffer,
-            CompressionType::Fast, // Use fast compression
-            FilterType::NoFilter,  // Disable filtering for speed
-        );
+        let encoder =
+            PngEncoder::new_with_quality(&mut buffer, CompressionType::Fast, FilterType::NoFilter);
 
-        // Write image data directly
-        let result = encoder.write_image(&image, image.width(), image.height(), ColorType::Rgb8);
-
-        match result {
+        match encoder.write_image(&image, image.width(), image.height(), ColorType::Rgb8) {
             Ok(_) => {
-                println!(
+                info!(
                     "PNG encoding successful, output size: {} bytes",
                     buffer.len()
                 );
                 let bytes = PyBytes::new(py, &buffer);
                 Ok(bytes.into())
             }
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                "Failed to encode image: {}",
-                e
-            ))),
+            Err(e) => {
+                error!("Failed to encode PNG: {}", e);
+                Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to encode image: {}",
+                    e
+                )))
+            }
         }
     });
     let encoding_time = start_time_encoding.elapsed();
-    println!("plot_mel_spec_py encoding time: {:?}", encoding_time);
-    println!("plot_mel_spec_py total time: {:?}", start_time.elapsed());
-    println!("plot_mel_spec_py performance breakdown:");
-    println!("  - Plotting: {:?}", plotting_time);
-    println!("  - Encoding: {:?}", encoding_time);
+    info!("plot_mel_spec_py encoding time: {:?}", encoding_time);
+    info!("plot_mel_spec_py total time: {:?}", start_time.elapsed());
+    debug!("plot_mel_spec_py performance breakdown:");
+    debug!("  - Plotting: {:?}", plotting_time);
+    debug!("  - Encoding: {:?}", encoding_time);
     result
 }
 
@@ -630,7 +633,7 @@ pub fn create_mel_config(
         spectrogram_config,
         chunk_size,
     );
-    println!(
+    debug!(
         "create_mel_config execution time: {:?}",
         start_time.elapsed()
     );

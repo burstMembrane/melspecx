@@ -1,3 +1,14 @@
+use once_cell::sync::Lazy;
+use std::sync::Once;
+
+static INIT_LOGGER: Once = Once::new();
+static LOGGER: Lazy<()> = Lazy::new(|| {
+    INIT_LOGGER.call_once(|| {
+        env_logger::init();
+        log::info!("Initialized melspecx logger");
+    });
+});
+
 #[cfg(feature = "python-bindings")]
 use pyo3::prelude::*;
 
@@ -12,6 +23,9 @@ pub mod mel;
 #[cfg(feature = "python-bindings")]
 #[pymodule]
 fn melspecx(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize logger when module is loaded
+    let _ = *LOGGER;
+
     #[cfg(feature = "python-bindings")]
     {
         // add docstrings to the functions

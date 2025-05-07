@@ -15,6 +15,11 @@ pub enum Colormap {
     Purples,
     Oranges,
 }
+impl Default for Colormap {
+    fn default() -> Self {
+        Colormap::Inferno
+    }
+}
 
 impl<'py> FromPyObject<'py> for Colormap {
     fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
