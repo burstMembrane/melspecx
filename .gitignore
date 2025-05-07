@@ -9,7 +9,7 @@ __pycache__/
 *.so
 # data files
 data/
-
+test.ipynb
 target/
 *.png
 !assets/*.png
