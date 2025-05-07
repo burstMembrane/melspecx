@@ -43,12 +43,3 @@ print("Generated mel spectrogram in {:0.2f} seconds".format(time() - start))
 image = melspecx.plot_mel_spec_py(mel_spec, "inferno", 1024, 256)
 with open("test.png", "wb") as f:
     f.write(image)
-
-
-# test plot from path
-
-start = time()
-out = melspecx.mel_spec_from_path(
-    str(AUDIO_PATH), 2048, 512, 1024, 0, sr / 2, 128, "inferno", 1024, 256, 80
-)
-print("Generated mel spectrogram in {:0.2f} seconds".format(time() - start))

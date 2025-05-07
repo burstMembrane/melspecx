@@ -237,19 +237,7 @@ fn spectrogram(
     _hop_length: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
-    let device: <Runtime as cubecl::Runtime>::Device = Default::default();
-    let mut spec = Vec::new();
-    for chunk in waveform.chunks(n_fft) {
-        let mut frame = vec![0.0f32; n_fft];
-        frame[..chunk.len()].copy_from_slice(chunk);
-        let (real, imag) = gpu_fft_fft::<Runtime>(&device, frame);
-        let half = if onesided { n_fft / 2 + 1 } else { n_fft };
-        let mut mags = Vec::with_capacity(half);
-        for i in 0..half {
-            mags.push((real[i].powi(2) + imag[i].powi(2)).sqrt());
-        }
-        spec.push(mags);
-    }
+    let spec = gpu_spectrogram(waveform, n_fft, _win_length, _hop_length, onesided);
     spec
 }
 
@@ -404,13 +392,10 @@ pub fn plot_mel_spec(
             let val = val_top * (1.0 - mel_frac) + val_bottom * mel_frac;
 
             // Convert to color
-            if val.is_finite() && smin != smax {
-                let norm = ((val - smin) / (smax - smin)).clamp(0.0, 1.0);
-                let idx = (norm * 255.0).round() as usize;
-                image.put_pixel(px, py, Rgb(color_map[idx.min(255)]));
-            } else {
-                image.put_pixel(px, py, Rgb([0, 0, 0])); // fallback for NaNs or constant images
-            }
+            let norm = (val - smin) / (smax - smin + f32::EPSILON);
+            let idx = (norm * 255.0).round().clamp(0.0, 255.0) as usize;
+            let color = color_map[idx];
+            image.put_pixel(px, py, Rgb(color));
         }
     }
 
