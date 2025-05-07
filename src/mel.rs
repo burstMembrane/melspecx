@@ -22,6 +22,12 @@ use pyo3::types::PyBytes;
 use crate::audio::read_wav;
 
 use std::io::Cursor;
+
+// For faster PNG encoding
+#[cfg(feature = "python-bindings")]
+use image::codecs::png::PngEncoder;
+#[cfg(feature = "python-bindings")]
+use image::ColorType;
 type Runtime = cubecl::wgpu::WgpuRuntime;
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
@@ -100,7 +106,7 @@ fn gpu_spectrogram(
     let total_ffts = (waveform.len() + frame_size - 1) / frame_size;
 
     // Batch all frames into a contiguous buffer
-    let mut batched_input: Vec<f32> = waveform
+    let batched_input: Vec<f32> = waveform
         .chunks(frame_size)
         .flat_map(|chunk| {
             let mut frame = vec![0.0f32; frame_size];
@@ -458,18 +464,21 @@ pub fn plot_mel_spec_py(
     width_px: u32,
     height_px: u32,
 ) -> PyResult<Py<PyAny>> {
+    use image::ImageEncoder;
+
     let start_time = Instant::now();
     let image = plot_mel_spec(mel_spec, cmap, width_px, height_px);
     println!("plot_mel_spec_py plotting time: {:?}", start_time.elapsed());
 
     let start_time_encoding = Instant::now();
     let result = Python::with_gil(|py| {
-        // Convert image to PNG bytes
-        let mut buffer = Cursor::new(Vec::new());
-        match image.write_to(&mut buffer, image::ImageFormat::Png) {
+        // Use image::codecs::png::PngEncoder for faster PNG encoding
+        let mut buffer = Vec::new();
+        let encoder = PngEncoder::new(&mut buffer);
+        let result = encoder.write_image(&image, image.width(), image.height(), ColorType::Rgb8);
+        match result {
             Ok(_) => {
-                // Convert to Python bytes object
-                let bytes = PyBytes::new(py, &buffer.into_inner());
+                let bytes = PyBytes::new(py, &buffer);
                 Ok(bytes.into())
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
