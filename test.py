@@ -6,7 +6,7 @@ import melspecx
 from IPython.display import Image
 from melspecx import create_mel_config
 
-AUDIO_PATH = Path("./data/suzannetrimmed.wav")
+AUDIO_PATH = Path("./data/suzanne.wav")
 audio, sr = melspecx.read_wav(str(AUDIO_PATH), normalize=True)
 
 
@@ -21,6 +21,7 @@ class MelConfig:
     n_mels: int
     top_db: float
     onesided: bool
+    chunk_size: int
 
 
 config = create_mel_config(
@@ -33,12 +34,24 @@ config = create_mel_config(
     n_mels=128,
     top_db=60,
     onesided=True,
+    chunk_size=4096,
 )
-# convert to named tuple
+
+audio, sr = melspecx.read_wav(str(AUDIO_PATH), normalize=True)
+# get the number of samples in the audio
+num_samples = len(audio)
+print(num_samples)
 start = time()
-config = MelConfig(**config)
+config = MelConfig(**config, chunk_size=4096)
+
+
 mel_spec = melspecx.mel_spectrogram_db_py(config, audio)
+# get the number of mel bins
+num_mel_bins = len(mel_spec)
+print(num_mel_bins)
 print("Generated mel spectrogram in {:0.2f} seconds".format(time() - start))
-image = melspecx.plot_mel_spec_py(mel_spec, "greys", 1024, 256)
+image = melspecx.plot_mel_spec_py(
+    mel_spec, cmap="inferno", width_px=num_mel_bins, height_px=512
+)
 with open("test.png", "wb") as f:
     f.write(image)
