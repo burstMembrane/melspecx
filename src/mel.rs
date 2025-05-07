@@ -39,6 +39,24 @@ use rayon::prelude::*;
 use std::default::Default;
 use std::io::Cursor;
 type Runtime = cubecl::wgpu::WgpuRuntime;
+/// Mel spectrogram from path
+///
+/// # Arguments
+///
+/// * `path` - The path to the audio file
+/// * `n_fft` - The number of FFT bins
+/// * `win_length` - The length of the window
+/// * `hop_length` - The hop length
+/// * `f_min` - The minimum frequency
+/// * `f_max` - The maximum frequency
+/// * `n_mels` - The number of mel bands
+/// * `colormap` - The colormap to use
+/// * `width_px` - The width of the image
+/// * `height_px` - The height of the image
+/// * `top_db` - The top dB value
+/// # Returns
+///
+/// A PyBytes object containing the PNG image
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
 pub fn mel_spec_from_path(
@@ -57,7 +75,7 @@ pub fn mel_spec_from_path(
     // log start time to python
     let start_time = Instant::now();
     let cmap = colors::Colormap::from_name(&colormap).unwrap();
-    let (audio, sr) = read_wav(path, Some(true)).unwrap();
+    let (audio, sr) = read_wav(path, Some(true), None, None).unwrap();
     println!("Audio read time: {:?}", start_time.elapsed());
     let start_time = Instant::now();
     let mel_spec = mel_spectrogram_db(
@@ -475,6 +493,15 @@ fn _assert_complex_eq(left: Complex<f32>, right: Complex<f32>) {
     );
 }
 
+/// Generate a mel spectrogram
+///
+/// # Arguments
+///
+/// * `config` - A MelConfig object @see create_mel_config
+/// * `waveform` - The waveform to generate the mel spectrogram from
+/// # Returns
+///
+/// A computed mel spectrogram as a list of lists of floats
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
 pub fn mel_spectrogram_db_py(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
@@ -487,6 +514,17 @@ pub fn mel_spectrogram_db_py(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f
     result
 }
 
+/// Plot a mel spectrogram
+///
+/// # Arguments
+///
+/// * `mel_spec` - The mel spectrogram to plot
+/// * `cmap` - The colormap to use
+/// * `width_px` - The width of the image
+/// * `height_px` - The height of the image
+/// # Returns
+///
+/// A PyBytes object containing the PNG image
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
 pub fn plot_mel_spec_py(
@@ -523,6 +561,22 @@ pub fn plot_mel_spec_py(
     result
 }
 
+/// Create a MelConfig object
+///
+/// # Arguments
+///
+/// * `sample_rate` - The sample rate of the audio
+/// * `n_fft` - The number of FFT bins
+/// * `win_length` - The length of the window
+/// * `hop_length` - The hop length
+/// * `f_min` - The minimum frequency
+/// * `f_max` - The maximum frequency
+/// * `n_mels` - The number of mel bands
+/// * `top_db` - The top dB value
+/// * `onesided` - Whether to use a one-sided FFT
+/// # Returns
+///
+/// A MelConfig object for use in the mel_spectrogram_db_py function
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
 pub fn create_mel_config(

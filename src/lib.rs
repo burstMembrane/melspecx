@@ -2,7 +2,6 @@
 use pyo3::prelude::*;
 
 pub mod audio;
-// pub mod bindings;
 pub mod colors;
 pub mod fft;
 pub mod mel;
@@ -15,6 +14,7 @@ pub mod mel;
 fn melspecx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "python-bindings")]
     {
+        // add docstrings to the functions
         m.add_function(wrap_pyfunction!(audio::read_wav, m)?)?;
         m.add_function(wrap_pyfunction!(mel::mel_spec_from_path, m)?)?;
         m.add_function(wrap_pyfunction!(mel::plot_mel_spec_py, m)?)?;

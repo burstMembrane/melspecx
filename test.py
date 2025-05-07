@@ -7,7 +7,7 @@ from IPython.display import Image
 from melspecx import create_mel_config
 
 AUDIO_PATH = Path("./data/suzannetrimmed.wav")
-audio, sr = melspecx.read_wav(str(AUDIO_PATH), normalize=True)
+audio, sr = melspecx.read_wav(str(AUDIO_PATH), normalize=True, offset=0, duration=None)
 
 
 @dataclass
@@ -29,13 +29,12 @@ config = create_mel_config(
     win_length=512,
     hop_length=1024,
     f_min=0,
-    f_max=sr / 2,
+    f_max=8000,
     n_mels=128,
-    top_db=80,
+    top_db=60,
     onesided=True,
 )
 # convert to named tuple
-
 start = time()
 config = MelConfig(**config)
 mel_spec = melspecx.mel_spectrogram_db_py(config, audio)

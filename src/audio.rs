@@ -139,7 +139,11 @@ pub fn generate_sine_wave(
     audio_data
 }
 
-fn _read_wav(path: &str) -> Result<(Vec<Vec<f32>>, usize), WavError> {
+fn _read_wav(
+    path: &str,
+    offset: Option<f32>,
+    duration: Option<f32>,
+) -> Result<(Vec<Vec<f32>>, usize), WavError> {
     let wav_reader = WavReader::open(path)?;
 
     let spec = wav_reader.spec();
@@ -151,11 +155,34 @@ fn _read_wav(path: &str) -> Result<(Vec<Vec<f32>>, usize), WavError> {
 
     let num_samples = wav_reader.len() as usize;
 
+    // Calculate start and end samples based on offset and duration
+    let start_sample = if let Some(offset) = offset {
+        (offset * sample_rate as f32) as usize
+    } else {
+        0
+    };
+
+    let end_sample = if let Some(duration) = duration {
+        let end = start_sample + (duration * sample_rate as f32) as usize;
+        end.min(num_samples)
+    } else {
+        num_samples
+    };
+
+    // Ensure we don't read past the end of the file
+    if start_sample >= num_samples {
+        return Err(WavError::Format(()));
+    }
+
+    let samples_to_read = end_sample - start_sample;
+
     let sample_bytes = (spec.bits_per_sample as usize + 7) / 8;
-    let data_bytes = num_samples * sample_bytes;
+    let data_bytes = samples_to_read * sample_bytes;
+    let start_byte = start_sample * sample_bytes;
 
     let mut buf_reader = wav_reader.into_inner(); // this is BufReader<File>
-    let data_offset = buf_reader.seek(SeekFrom::Current(0))?;
+    let header_offset = buf_reader.seek(SeekFrom::Current(0))?;
+    let data_offset = header_offset + start_byte as u64;
     let file = buf_reader.into_inner();
 
     let mmap = unsafe { Mmap::map(&file)? };
@@ -171,7 +198,7 @@ mod tests {
     #[test]
     fn test_read_mono_wav() {
         let path = "./testdata/test.wav";
-        let (channels, sample_rate) = _read_wav(path).unwrap();
+        let (channels, sample_rate) = _read_wav(path, None, None).unwrap();
         assert_eq!(channels.len(), 1); // Mono file
         assert_eq!(channels[0].len(), 16000);
         assert_eq!(sample_rate, 16000);
@@ -181,7 +208,7 @@ mod tests {
     fn test_read_stereo_wav() {
         // Assumes you have a stereo test file
         let path = "./testdata/stereo_test.wav";
-        if let Ok((channels, _sample_rate)) = _read_wav(path) {
+        if let Ok((channels, _sample_rate)) = _read_wav(path, None, None) {
             assert_eq!(channels.len(), 2); // Stereo file
             assert_eq!(channels[0].len(), channels[1].len());
         }
@@ -193,13 +220,20 @@ mod tests {
 /// Args:
 ///     path: Path to the WAV file
 ///     normalize: Whether to normalize audio to range [-1.0, 1.0] (default: true)
+///     offset: Offset in seconds from the start of the file (default: None)
+///     duration: Duration in seconds to read from the file (default: None)
 ///
 /// Returns:
 ///     tuple: (audio_data, sample_rate)
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
-pub fn read_wav(path: String, normalize: Option<bool>) -> PyResult<(Vec<f32>, u32)> {
-    let result = _read_wav(&path).map_err(|e| {
+pub fn read_wav(
+    path: String,
+    normalize: Option<bool>,
+    offset: Option<f32>,
+    duration: Option<f32>,
+) -> PyResult<(Vec<f32>, u32)> {
+    let result = _read_wav(&path, None, None).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read WAV file: {:?}", e))
     })?;
 
