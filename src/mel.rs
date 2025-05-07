@@ -60,6 +60,7 @@ pub fn mel_spec_from_path(
     width_px: u32,
     height_px: u32,
     top_db: f32,
+    chunk_size: usize,
 ) -> PyResult<Py<PyAny>> {
     // log start time to python
     let start_time = Instant::now();
@@ -78,6 +79,7 @@ pub fn mel_spec_from_path(
             n_mels,
             top_db,
             SpectrogramConfig::new(true),
+            chunk_size,
         ),
         audio,
     );
@@ -114,38 +116,47 @@ fn gpu_spectrogram(
     n_fft: usize,
     _win_length: usize,
     _hop_length: usize,
+    chunk_size: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
     let start_time = Instant::now();
     let device = GPU_DEVICE.clone();
 
-    let frame_size = n_fft;
-
-    // Batch all frames into a contiguous buffer
-    let batched_input: Vec<f32> = waveform
-        .chunks(frame_size)
-        .flat_map(|chunk| {
-            let mut frame = vec![0.0f32; frame_size];
+    // Batch frames into chunks for efficient GPU processing
+    let batched_input: Vec<Vec<f32>> = waveform
+        .chunks(chunk_size)
+        .map(|chunk| {
+            let mut frame = vec![0.0f32; chunk_size];
             frame[..chunk.len()].copy_from_slice(chunk);
             frame
         })
         .collect();
     println!("Frame batching time: {:?}", start_time.elapsed());
 
-    // Perform per-frame FFT and magnitude computation in parallel
+    // Process each chunk and collect results
     let fft_start = Instant::now();
     let half = if onesided { n_fft / 2 + 1 } else { n_fft };
+
     let spec: Vec<Vec<f32>> = batched_input
-        .par_chunks(frame_size)
-        .map(|frame| {
-            let (real, imag) = fft::<Runtime>(&device, frame.to_vec());
-            real.iter()
-                .zip(imag.iter())
-                .take(half)
-                .map(|(r, i)| (r.powi(2) + i.powi(2)).sqrt())
-                .collect()
+        .into_par_iter()
+        .flat_map(|chunk| {
+            // Process each n_fft-sized window within the chunk
+            chunk
+                .chunks(n_fft)
+                .map(|frame| {
+                    let mut padded_frame = vec![0.0f32; n_fft];
+                    padded_frame[..frame.len()].copy_from_slice(frame);
+                    let (real, imag) = fft::<Runtime>(&device, padded_frame);
+                    real.iter()
+                        .zip(imag.iter())
+                        .take(half)
+                        .map(|(r, i)| (r.powi(2) + i.powi(2)).sqrt())
+                        .collect::<Vec<f32>>()
+                })
+                .collect::<Vec<Vec<f32>>>()
         })
         .collect();
+
     let fft_time = fft_start.elapsed();
 
     println!("GPU spectrogram total time: {:?}", start_time.elapsed());
@@ -180,6 +191,7 @@ impl Default for MelConfig {
         let n_mels = 128;
         let top_db = 80.0_f32;
         let spectrogram_config = SpectrogramConfig::default();
+        let chunk_size = 4096_usize;
         Self {
             sample_rate,
             n_fft,
@@ -190,6 +202,7 @@ impl Default for MelConfig {
             n_mels,
             top_db,
             spectrogram_config,
+            chunk_size,
         }
     }
 }
@@ -206,6 +219,7 @@ pub struct MelConfig {
     n_mels: usize,
     top_db: f32,
     spectrogram_config: SpectrogramConfig,
+    chunk_size: usize,
 }
 
 impl MelConfig {
@@ -219,6 +233,7 @@ impl MelConfig {
         n_mels: usize,
         top_db: f32,
         spectrogram_config: SpectrogramConfig,
+        chunk_size: usize,
     ) -> Self {
         Self {
             sample_rate,
@@ -230,6 +245,7 @@ impl MelConfig {
             n_mels,
             top_db,
             spectrogram_config,
+            chunk_size,
         }
     }
 }
@@ -245,6 +261,7 @@ fn mel_spectrogram(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
         config.n_fft,
         config.win_length,
         config.hop_length,
+        config.chunk_size,
         config.spectrogram_config.onesided,
     );
     let n_freqs = spectrogram[0].len();
@@ -276,9 +293,17 @@ fn spectrogram(
     n_fft: usize,
     _win_length: usize,
     _hop_length: usize,
+    chunk_size: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
-    let spec = gpu_spectrogram(waveform, n_fft, _win_length, _hop_length, onesided);
+    let spec = gpu_spectrogram(
+        waveform,
+        n_fft,
+        _win_length,
+        _hop_length,
+        chunk_size,
+        onesided,
+    );
     spec
 }
 
@@ -588,6 +613,7 @@ pub fn create_mel_config(
     n_mels: usize,
     top_db: f32,
     onesided: Option<bool>,
+    chunk_size: usize,
 ) -> MelConfig {
     let start_time = Instant::now();
     let spectrogram_config = SpectrogramConfig::new(onesided.unwrap_or(true));
@@ -602,6 +628,7 @@ pub fn create_mel_config(
         n_mels,
         top_db,
         spectrogram_config,
+        chunk_size,
     );
     println!(
         "create_mel_config execution time: {:?}",
@@ -622,7 +649,7 @@ impl<'py> FromPyObject<'py> for MelConfig {
         let f_max: f32 = ob.getattr("f_max")?.extract()?;
         let n_mels: usize = ob.getattr("n_mels")?.extract()?;
         let top_db: f32 = ob.getattr("top_db")?.extract()?;
-
+        let chunk_size: usize = ob.getattr("chunk_size")?.extract()?;
         // Get onesided flag or use default
         let onesided = match ob.getattr("onesided") {
             Ok(val) => val.extract()?,
@@ -641,6 +668,7 @@ impl<'py> FromPyObject<'py> for MelConfig {
             n_mels,
             top_db,
             spectrogram_config,
+            chunk_size,
         ))
     }
 }

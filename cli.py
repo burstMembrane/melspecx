@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--height_px", type=int, default=256)
     parser.add_argument("--top_db", type=float, default=60)
     parser.add_argument("--onesided", type=bool, default=True)
-
+    parser.add_argument("--chunk_size", type=int, default=1024)
     args = parser.parse_args()
 
     image = melspecx.mel_spec_from_path(
@@ -35,6 +35,7 @@ def main():
         width_px=args.width_px,
         height_px=args.height_px,
         top_db=args.top_db,
+        chunk_size=args.chunk_size,
     )
     with open(args.output_file, "wb") as f:
         f.write(image)
