@@ -1,30 +1,17 @@
 use crate::colors;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use std::collections::HashMap;
-
 static GPU_DEVICE: Lazy<WgpuDevice> = Lazy::new(|| Default::default());
-static FILTERBANKS: Lazy<HashMap<(usize, u32, usize), Array2<f32>>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    let n_fft = 1024;
-    let n_freqs = n_fft / 2 + 1;
-    for &sample_rate in &[44100.0f32, 22050.0, 16000.0, 8000.0] {
-        let f_min = 0.0;
-        let f_max = sample_rate / 2.0;
-        for &n_mels in &[96usize, 128usize] {
-            let fbanks = mel_filter_bank(n_freqs, f_min, f_max, n_mels, sample_rate);
-            let fbanks_flat: Vec<f32> = fbanks.into_iter().flatten().collect();
-            let arr = Array2::from_shape_vec((n_mels, n_freqs), fbanks_flat).unwrap();
-            m.insert((n_fft, sample_rate as u32, n_mels), arr);
-        }
-    }
-    m
-});
+
 use crate::fft::fft;
 use cubecl::wgpu::WgpuDevice;
+use gpu_fft::fft::fft as gpu_fft_fft;
 use image::ImageBuffer;
 use image::Rgb;
 use ndarray::Array2;
 use num::complex::Complex;
+use std::default::Default;
 use std::time::Instant;
 
 // Only include this when the python-bindings feature is enabled
@@ -35,8 +22,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::audio::read_wav;
-use rayon::prelude::*;
-use std::default::Default;
+
 use std::io::Cursor;
 type Runtime = cubecl::wgpu::WgpuRuntime;
 #[cfg(feature = "python-bindings")]
@@ -110,54 +96,19 @@ fn gpu_spectrogram(
     _hop_length: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
-    let start_time = Instant::now();
-    let device = &*GPU_DEVICE;
-
-    println!("CubeCL WGPU device initialized");
-    println!("Using device type: WGPU");
-    println!("GPU device initialization time: {:?}", start_time.elapsed());
-
-    let start_time = Instant::now();
-    let chunk_size = n_fft * 2;
-
-    // Precompute all padded frames
-    let frames: Vec<Vec<f32>> = waveform
-        .par_chunks(chunk_size)
-        .map(|chunk| {
-            let mut frame = vec![0.0f32; chunk_size];
-            frame[..chunk.len()].copy_from_slice(chunk);
-            frame
-        })
-        .collect();
-    println!("Frame computation time: {:?}", start_time.elapsed());
-
-    let total_ffts = frames.len();
-    let fft_start = Instant::now();
-
-    let spec: Vec<Vec<f32>> = frames
-        .into_par_iter()
-        .map(|frame| {
-            let (real, imag) = fft::<Runtime>(device, frame);
-            let half = if onesided { n_fft / 2 + 1 } else { n_fft };
-            (0..half)
-                .map(|i| (real[i].powi(2) + imag[i].powi(2)).sqrt())
-                .collect()
-        })
-        .collect();
-
-    let fft_time = fft_start.elapsed();
-    println!(
-        "GPU spectrogram total processing time: {:?}",
-        start_time.elapsed()
-    );
-    println!(
-        "Average FFT time: {:?}",
-        fft_time.div_f32(total_ffts as f32)
-    );
-
-    println!("Total FFT operations: {}", total_ffts);
-    println!("GPU spectrogram chunks count: {}", waveform.len() / n_fft);
-    println!("GPU spectrogram time: {:?}", start_time.elapsed());
+    let device: <Runtime as cubecl::Runtime>::Device = Default::default();
+    let mut spec = Vec::new();
+    for chunk in waveform.chunks(n_fft) {
+        let mut frame = vec![0.0f32; n_fft];
+        frame[..chunk.len()].copy_from_slice(chunk);
+        let (real, imag) = fft::<Runtime>(&device, frame);
+        let half = if onesided { n_fft / 2 + 1 } else { n_fft };
+        let mut mags = Vec::with_capacity(half);
+        for i in 0..half {
+            mags.push((real[i].powi(2) + imag[i].powi(2)).sqrt());
+        }
+        spec.push(mags);
+    }
     spec
 }
 
@@ -176,7 +127,31 @@ impl SpectrogramConfig {
         Self { onesided }
     }
 }
-
+impl Default for MelConfig {
+    fn default() -> Self {
+        // These values mirror the CLI defaults:
+        let sample_rate = 22050.0_f32;
+        let n_fft = 2048;
+        let win_length = 2048;
+        let hop_length = 512;
+        let f_min = 0.0_f32;
+        let f_max = 8000.0_f32;
+        let n_mels = 128;
+        let top_db = 80.0_f32;
+        let spectrogram_config = SpectrogramConfig::default();
+        Self {
+            sample_rate,
+            n_fft,
+            win_length,
+            hop_length,
+            f_min,
+            f_max,
+            n_mels,
+            top_db,
+            spectrogram_config,
+        }
+    }
+}
 // derive a struct from the MelConfig struct
 #[derive(Clone)]
 #[cfg_attr(feature = "python-bindings", derive(IntoPyObjectRef))]
@@ -218,17 +193,12 @@ impl MelConfig {
     }
 }
 pub fn mel_spectrogram_db(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
-    let start_time = Instant::now();
+    let top_db = config.top_db;
     let mel_spec: Vec<Vec<f32>> = mel_spectrogram(config, waveform);
-    println!(
-        "Mel spectrogram computation time: {:?}",
-        start_time.elapsed()
-    );
-    mel_spec
+    amplitude_to_db(mel_spec, top_db)
 }
 
 fn mel_spectrogram(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
-    let start_time = Instant::now();
     let spectrogram = spectrogram(
         waveform,
         config.n_fft,
@@ -236,62 +206,51 @@ fn mel_spectrogram(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
         config.hop_length,
         config.spectrogram_config.onesided,
     );
-    println!("Spectrogram generation time: {:?}", start_time.elapsed());
-
-    let start_time = Instant::now();
-    let frames = spectrogram.len();
     let n_freqs = spectrogram[0].len();
-    let spec_flat: Vec<f32> = spectrogram.into_iter().flatten().collect();
-    let spec_arr = Array2::from_shape_vec((frames, n_freqs), spec_flat).unwrap();
-
-    // Use cached filterbank if available, otherwise compute dynamically
-    let fbanks_arr: Array2<f32> = if let Some(arr) =
-        FILTERBANKS.get(&(config.n_fft, config.sample_rate as u32, config.n_mels))
-    {
-        arr.clone()
-    } else {
-        let n_freqs = config.n_fft / 2 + 1;
-        let fbanks = mel_filter_bank(
-            n_freqs,
-            config.f_min,
-            config.f_max,
-            config.n_mels,
-            config.sample_rate,
-        );
-        let fbanks_flat: Vec<f32> = fbanks.into_iter().flatten().collect();
-        Array2::from_shape_vec((config.n_mels, n_freqs), fbanks_flat).unwrap()
-    };
-    let mel_arr = spec_arr.dot(&fbanks_arr.t());
-
-    // Fuse amplitude→dB conversion
-    let epsilon = 1e-10f32;
-    let result: Vec<Vec<f32>> = mel_arr
-        .mapv(|x| 20.0 * x.max(epsilon).log10())
-        .outer_iter()
-        .map(|row| row.to_vec())
-        .collect();
-    println!(
-        "Mel filtering + dB conversion time: {:?}",
-        start_time.elapsed()
+    let fbanks = mel_filter_bank(
+        n_freqs,
+        config.f_min,
+        config.f_max,
+        config.n_mels,
+        config.sample_rate,
     );
-    result
+    spectrogram
+        .into_par_iter()
+        .map(|spec_row| {
+            (0..config.n_mels)
+                .map(|j| {
+                    spec_row
+                        .iter()
+                        .zip(fbanks.iter())
+                        .map(|(&s, fbank)| s * fbank[j])
+                        .sum()
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn spectrogram(
     waveform: Vec<f32>,
     n_fft: usize,
-    win_length: usize,
-    hop_length: usize,
+    _win_length: usize,
+    _hop_length: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
-    let start_time = Instant::now();
-    // GPU-accelerated FFT
-    let result = gpu_spectrogram(waveform, n_fft, win_length, hop_length, onesided);
-    println!(
-        "Total spectrogram function time: {:?}",
-        start_time.elapsed()
-    );
-    result
+    let device: <Runtime as cubecl::Runtime>::Device = Default::default();
+    let mut spec = Vec::new();
+    for chunk in waveform.chunks(n_fft) {
+        let mut frame = vec![0.0f32; n_fft];
+        frame[..chunk.len()].copy_from_slice(chunk);
+        let (real, imag) = gpu_fft_fft::<Runtime>(&device, frame);
+        let half = if onesided { n_fft / 2 + 1 } else { n_fft };
+        let mut mags = Vec::with_capacity(half);
+        for i in 0..half {
+            mags.push((real[i].powi(2) + imag[i].powi(2)).sqrt());
+        }
+        spec.push(mags);
+    }
+    spec
 }
 
 fn mel_filter_bank(
@@ -614,4 +573,29 @@ impl<'py> IntoPyObject<'py> for MelConfig {
         let dict_any = dict.into_pyobject(py)?.into_any();
         Ok(dict_any)
     }
+}
+
+fn amplitude_to_db(amplitudes: Vec<Vec<f32>>, top_db: f32) -> Vec<Vec<f32>> {
+    use rayon::prelude::*;
+    let dbs: Vec<Vec<f32>> = amplitudes
+        .into_par_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|amp| 20.0 * amp.max(1e-10).log10())
+                .collect()
+        })
+        .collect();
+
+    let max_db = dbs
+        .iter()
+        .flat_map(|row| row.iter())
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let clipped: Vec<Vec<f32>> = dbs
+        .into_par_iter()
+        .map(|row| row.into_iter().map(|db| db.max(max_db - top_db)).collect())
+        .collect();
+
+    clipped
 }

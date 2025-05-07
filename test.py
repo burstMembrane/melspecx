@@ -31,7 +31,7 @@ config = create_mel_config(
     f_min=0,
     f_max=sr / 2,
     n_mels=128,
-    top_db=80,
+    top_db=60,
     onesided=True,
 )
 # convert to named tuple
