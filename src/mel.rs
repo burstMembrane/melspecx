@@ -100,43 +100,31 @@ fn gpu_spectrogram(
     let total_ffts = (waveform.len() + frame_size - 1) / frame_size;
 
     // Batch all frames into a contiguous buffer
-    let mut batched_input = Vec::with_capacity(total_ffts * frame_size);
-    for idx in 0..total_ffts {
-        let offset = idx * frame_size;
-        let end = usize::min(offset + frame_size, waveform.len());
-        let mut frame = vec![0.0f32; frame_size];
-        frame[..(end - offset)].copy_from_slice(&waveform[offset..end]);
-        batched_input.extend_from_slice(&frame);
-    }
+    let mut batched_input: Vec<f32> = waveform
+        .chunks(frame_size)
+        .flat_map(|chunk| {
+            let mut frame = vec![0.0f32; frame_size];
+            frame[..chunk.len()].copy_from_slice(chunk);
+            frame
+        })
+        .collect();
     println!("Frame batching time: {:?}", start_time.elapsed());
 
-    // Perform per-frame FFT using the cached device
+    // Perform per-frame FFT and magnitude computation in parallel
     let fft_start = Instant::now();
     let half = if onesided { n_fft / 2 + 1 } else { n_fft };
-    let mut reals = Vec::with_capacity(total_ffts * half);
-    let mut imags = Vec::with_capacity(total_ffts * half);
-    for idx in 0..total_ffts {
-        let start = idx * frame_size;
-        let frame = batched_input[start..start + frame_size].to_vec();
-        let (real, imag) = fft::<Runtime>(&device, frame);
-        reals.extend_from_slice(&real[..half]);
-        imags.extend_from_slice(&imag[..half]);
-    }
+    let spec: Vec<Vec<f32>> = batched_input
+        .par_chunks(frame_size)
+        .map(|frame| {
+            let (real, imag) = fft::<Runtime>(&device, frame.to_vec());
+            real.iter()
+                .zip(imag.iter())
+                .take(half)
+                .map(|(r, i)| (r.powi(2) + i.powi(2)).sqrt())
+                .collect()
+        })
+        .collect();
     let fft_time = fft_start.elapsed();
-
-    // Compute magnitudes
-    let mut spec = Vec::with_capacity(total_ffts);
-    for b in 0..total_ffts {
-        let offset = b * half;
-        let mags = (0..half)
-            .map(|i| {
-                let r = reals[offset + i];
-                let im = imags[offset + i];
-                (r.powi(2) + im.powi(2)).sqrt()
-            })
-            .collect();
-        spec.push(mags);
-    }
 
     println!("GPU spectrogram total time: {:?}", start_time.elapsed());
     println!("FFT compute time: {:?}", fft_time);
