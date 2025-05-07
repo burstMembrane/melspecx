@@ -10,6 +10,7 @@ __pycache__/
 # data files
 data/
 test.ipynb
+test.py
 target/
 *.png
 !assets/*.png
