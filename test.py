@@ -7,7 +7,7 @@ from IPython.display import Image
 from melspecx import create_mel_config
 
 AUDIO_PATH = Path("./data/suzannetrimmed.wav")
-audio, sr = melspecx.read_wav(str(AUDIO_PATH), normalize=True, offset=0, duration=None)
+audio, sr = melspecx.read_wav(str(AUDIO_PATH), normalize=True)
 
 
 @dataclass
@@ -39,6 +39,6 @@ start = time()
 config = MelConfig(**config)
 mel_spec = melspecx.mel_spectrogram_db_py(config, audio)
 print("Generated mel spectrogram in {:0.2f} seconds".format(time() - start))
-image = melspecx.plot_mel_spec_py(mel_spec, "inferno", 1024, 256)
+image = melspecx.plot_mel_spec_py(mel_spec, "greys", 1024, 256)
 with open("test.png", "wb") as f:
     f.write(image)
