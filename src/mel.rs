@@ -102,7 +102,7 @@ fn gpu_spectrogram(
     let start_time = Instant::now();
     let device = GPU_DEVICE.clone();
 
-    let frame_size = n_fft * 2;
+    let frame_size = n_fft;
     let total_ffts = (waveform.len() + frame_size - 1) / frame_size;
 
     // Batch all frames into a contiguous buffer
@@ -455,7 +455,6 @@ pub fn mel_spectrogram_db_py(config: MelConfig, waveform: Vec<f32>) -> Vec<Vec<f
     );
     result
 }
-
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
 pub fn plot_mel_spec_py(
@@ -464,20 +463,48 @@ pub fn plot_mel_spec_py(
     width_px: u32,
     height_px: u32,
 ) -> PyResult<Py<PyAny>> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     use image::ImageEncoder;
 
+    println!(
+        "Starting plot_mel_spec_py with dimensions {}x{}",
+        width_px, height_px
+    );
     let start_time = Instant::now();
+
     let image = plot_mel_spec(mel_spec, cmap, width_px, height_px);
-    println!("plot_mel_spec_py plotting time: {:?}", start_time.elapsed());
+    let plotting_time = start_time.elapsed();
+    println!("plot_mel_spec_py plotting time: {:?}", plotting_time);
 
     let start_time_encoding = Instant::now();
     let result = Python::with_gil(|py| {
-        // Use image::codecs::png::PngEncoder for faster PNG encoding
-        let mut buffer = Vec::new();
-        let encoder = PngEncoder::new(&mut buffer);
+        println!(
+            "Starting PNG encoding with buffer size: {} bytes",
+            (width_px * height_px * 3) as usize
+        );
+
+        let start_time_buffer = Instant::now();
+        // Pre-allocate buffer with estimated size
+        let mut buffer = Vec::with_capacity((width_px * height_px * 3) as usize);
+        let buffer_time = start_time_buffer.elapsed();
+        println!("Buffer allocation time: {:?}", buffer_time);
+
+        // Use fast PNG encoding settings
+        let encoder = PngEncoder::new_with_quality(
+            &mut buffer,
+            CompressionType::Fast, // Use fast compression
+            FilterType::NoFilter,  // Disable filtering for speed
+        );
+
+        // Write image data directly
         let result = encoder.write_image(&image, image.width(), image.height(), ColorType::Rgb8);
+
         match result {
             Ok(_) => {
+                println!(
+                    "PNG encoding successful, output size: {} bytes",
+                    buffer.len()
+                );
                 let bytes = PyBytes::new(py, &buffer);
                 Ok(bytes.into())
             }
@@ -487,11 +514,12 @@ pub fn plot_mel_spec_py(
             ))),
         }
     });
-    println!(
-        "plot_mel_spec_py encoding time: {:?}",
-        start_time_encoding.elapsed()
-    );
+    let encoding_time = start_time_encoding.elapsed();
+    println!("plot_mel_spec_py encoding time: {:?}", encoding_time);
     println!("plot_mel_spec_py total time: {:?}", start_time.elapsed());
+    println!("plot_mel_spec_py performance breakdown:");
+    println!("  - Plotting: {:?}", plotting_time);
+    println!("  - Encoding: {:?}", encoding_time);
     result
 }
 
