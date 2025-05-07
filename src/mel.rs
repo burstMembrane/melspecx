@@ -1,15 +1,13 @@
 use crate::colors;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use std::collections::HashMap;
 static GPU_DEVICE: Lazy<WgpuDevice> = Lazy::new(|| Default::default());
 
 use crate::fft::fft;
 use cubecl::wgpu::WgpuDevice;
-use gpu_fft::fft::fft as gpu_fft_fft;
 use image::ImageBuffer;
 use image::Rgb;
-use ndarray::Array2;
+
 use num::complex::Complex;
 use std::default::Default;
 use std::time::Instant;
@@ -88,7 +86,6 @@ pub fn mel_spec_from_path(
     println!("Image encoding time: {:?}", start_time.elapsed());
     result
 }
-
 fn gpu_spectrogram(
     waveform: Vec<f32>,
     n_fft: usize,
@@ -96,22 +93,56 @@ fn gpu_spectrogram(
     _hop_length: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
-    let device: <Runtime as cubecl::Runtime>::Device = Default::default();
-    let mut spec = Vec::new();
-    for chunk in waveform.chunks(n_fft) {
-        let mut frame = vec![0.0f32; n_fft];
-        frame[..chunk.len()].copy_from_slice(chunk);
+    let start_time = Instant::now();
+    let device = GPU_DEVICE.clone();
+
+    let frame_size = n_fft * 2;
+    let total_ffts = (waveform.len() + frame_size - 1) / frame_size;
+
+    // Batch all frames into a contiguous buffer
+    let mut batched_input = Vec::with_capacity(total_ffts * frame_size);
+    for idx in 0..total_ffts {
+        let offset = idx * frame_size;
+        let end = usize::min(offset + frame_size, waveform.len());
+        let mut frame = vec![0.0f32; frame_size];
+        frame[..(end - offset)].copy_from_slice(&waveform[offset..end]);
+        batched_input.extend_from_slice(&frame);
+    }
+    println!("Frame batching time: {:?}", start_time.elapsed());
+
+    // Perform per-frame FFT using the cached device
+    let fft_start = Instant::now();
+    let half = if onesided { n_fft / 2 + 1 } else { n_fft };
+    let mut reals = Vec::with_capacity(total_ffts * half);
+    let mut imags = Vec::with_capacity(total_ffts * half);
+    for idx in 0..total_ffts {
+        let start = idx * frame_size;
+        let frame = batched_input[start..start + frame_size].to_vec();
         let (real, imag) = fft::<Runtime>(&device, frame);
-        let half = if onesided { n_fft / 2 + 1 } else { n_fft };
-        let mut mags = Vec::with_capacity(half);
-        for i in 0..half {
-            mags.push((real[i].powi(2) + imag[i].powi(2)).sqrt());
-        }
+        reals.extend_from_slice(&real[..half]);
+        imags.extend_from_slice(&imag[..half]);
+    }
+    let fft_time = fft_start.elapsed();
+
+    // Compute magnitudes
+    let mut spec = Vec::with_capacity(total_ffts);
+    for b in 0..total_ffts {
+        let offset = b * half;
+        let mags = (0..half)
+            .map(|i| {
+                let r = reals[offset + i];
+                let im = imags[offset + i];
+                (r.powi(2) + im.powi(2)).sqrt()
+            })
+            .collect();
         spec.push(mags);
     }
+
+    println!("GPU spectrogram total time: {:?}", start_time.elapsed());
+    println!("FFT compute time: {:?}", fft_time);
+
     spec
 }
-
 #[derive(Clone)]
 #[cfg_attr(feature = "python-bindings", derive(IntoPyObject, IntoPyObjectRef))]
 pub struct SpectrogramConfig {
