@@ -12,6 +12,7 @@ data/
 
 target/
 *.png
+!assets/*.png
 # Distribution / packaging
 .Python
 .venv/
