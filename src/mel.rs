@@ -1,30 +1,15 @@
 use crate::colors;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
-
+use rayon::prelude::*;
 static GPU_DEVICE: Lazy<WgpuDevice> = Lazy::new(|| Default::default());
-static FILTERBANKS: Lazy<HashMap<(usize, u32, usize), Array2<f32>>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    let n_fft = 1024;
-    let n_freqs = n_fft / 2 + 1;
-    for &sample_rate in &[44100.0f32, 22050.0, 16000.0, 8000.0] {
-        let f_min = 0.0;
-        let f_max = sample_rate / 2.0;
-        for &n_mels in &[96usize, 128usize] {
-            let fbanks = mel_filter_bank(n_freqs, f_min, f_max, n_mels, sample_rate);
-            let fbanks_flat: Vec<f32> = fbanks.into_iter().flatten().collect();
-            let arr = Array2::from_shape_vec((n_mels, n_freqs), fbanks_flat).unwrap();
-            m.insert((n_fft, sample_rate as u32, n_mels), arr);
-        }
-    }
-    m
-});
+
 use crate::fft::fft;
 use cubecl::wgpu::WgpuDevice;
 use image::ImageBuffer;
 use image::Rgb;
-use ndarray::Array2;
+
 use num::complex::Complex;
+use std::default::Default;
 use std::time::Instant;
 
 // Only include this when the python-bindings feature is enabled
@@ -35,9 +20,13 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::audio::read_wav;
-use rayon::prelude::*;
-use std::default::Default;
+
 use std::io::Cursor;
+
+// For faster PNG encoding
+
+#[cfg(feature = "python-bindings")]
+use image::ColorType;
 type Runtime = cubecl::wgpu::WgpuRuntime;
 /// Mel spectrogram from path
 ///
@@ -75,7 +64,7 @@ pub fn mel_spec_from_path(
     // log start time to python
     let start_time = Instant::now();
     let cmap = colors::Colormap::from_name(&colormap).unwrap();
-    let (audio, sr) = read_wav(path, Some(true), None, None).unwrap();
+    let (audio, sr) = read_wav(path, Some(true)).unwrap();
     println!("Audio read time: {:?}", start_time.elapsed());
     let start_time = Instant::now();
     let mel_spec = mel_spectrogram_db(
@@ -120,7 +109,6 @@ pub fn mel_spec_from_path(
     println!("Image encoding time: {:?}", start_time.elapsed());
     result
 }
-
 fn gpu_spectrogram(
     waveform: Vec<f32>,
     n_fft: usize,
@@ -129,56 +117,42 @@ fn gpu_spectrogram(
     onesided: bool,
 ) -> Vec<Vec<f32>> {
     let start_time = Instant::now();
-    let device = &*GPU_DEVICE;
+    let device = GPU_DEVICE.clone();
 
-    println!("CubeCL WGPU device initialized");
-    println!("Using device type: WGPU");
-    println!("GPU device initialization time: {:?}", start_time.elapsed());
+    let frame_size = n_fft;
 
-    let start_time = Instant::now();
-    let chunk_size = n_fft * 2;
-
-    // Precompute all padded frames
-    let frames: Vec<Vec<f32>> = waveform
-        .par_chunks(chunk_size)
-        .map(|chunk| {
-            let mut frame = vec![0.0f32; chunk_size];
+    // Batch all frames into a contiguous buffer
+    let batched_input: Vec<f32> = waveform
+        .chunks(frame_size)
+        .flat_map(|chunk| {
+            let mut frame = vec![0.0f32; frame_size];
             frame[..chunk.len()].copy_from_slice(chunk);
             frame
         })
         .collect();
-    println!("Frame computation time: {:?}", start_time.elapsed());
+    println!("Frame batching time: {:?}", start_time.elapsed());
 
-    let total_ffts = frames.len();
+    // Perform per-frame FFT and magnitude computation in parallel
     let fft_start = Instant::now();
-
-    let spec: Vec<Vec<f32>> = frames
-        .into_par_iter()
+    let half = if onesided { n_fft / 2 + 1 } else { n_fft };
+    let spec: Vec<Vec<f32>> = batched_input
+        .par_chunks(frame_size)
         .map(|frame| {
-            let (real, imag) = fft::<Runtime>(device, frame);
-            let half = if onesided { n_fft / 2 + 1 } else { n_fft };
-            (0..half)
-                .map(|i| (real[i].powi(2) + imag[i].powi(2)).sqrt())
+            let (real, imag) = fft::<Runtime>(&device, frame.to_vec());
+            real.iter()
+                .zip(imag.iter())
+                .take(half)
+                .map(|(r, i)| (r.powi(2) + i.powi(2)).sqrt())
                 .collect()
         })
         .collect();
-
     let fft_time = fft_start.elapsed();
-    println!(
-        "GPU spectrogram total processing time: {:?}",
-        start_time.elapsed()
-    );
-    println!(
-        "Average FFT time: {:?}",
-        fft_time.div_f32(total_ffts as f32)
-    );
 
-    println!("Total FFT operations: {}", total_ffts);
-    println!("GPU spectrogram chunks count: {}", waveform.len() / n_fft);
-    println!("GPU spectrogram time: {:?}", start_time.elapsed());
+    println!("GPU spectrogram total time: {:?}", start_time.elapsed());
+    println!("FFT compute time: {:?}", fft_time);
+
     spec
 }
-
 #[derive(Clone)]
 #[cfg_attr(feature = "python-bindings", derive(IntoPyObject, IntoPyObjectRef))]
 pub struct SpectrogramConfig {
@@ -194,7 +168,31 @@ impl SpectrogramConfig {
         Self { onesided }
     }
 }
-
+impl Default for MelConfig {
+    fn default() -> Self {
+        // These values mirror the CLI defaults:
+        let sample_rate = 22050.0_f32;
+        let n_fft = 2048;
+        let win_length = 2048;
+        let hop_length = 512;
+        let f_min = 0.0_f32;
+        let f_max = 8000.0_f32;
+        let n_mels = 128;
+        let top_db = 80.0_f32;
+        let spectrogram_config = SpectrogramConfig::default();
+        Self {
+            sample_rate,
+            n_fft,
+            win_length,
+            hop_length,
+            f_min,
+            f_max,
+            n_mels,
+            top_db,
+            spectrogram_config,
+        }
+    }
+}
 // derive a struct from the MelConfig struct
 #[derive(Clone)]
 #[cfg_attr(feature = "python-bindings", derive(IntoPyObjectRef))]
@@ -236,17 +234,12 @@ impl MelConfig {
     }
 }
 pub fn mel_spectrogram_db(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
-    let start_time = Instant::now();
+    let top_db = config.top_db;
     let mel_spec: Vec<Vec<f32>> = mel_spectrogram(config, waveform);
-    println!(
-        "Mel spectrogram computation time: {:?}",
-        start_time.elapsed()
-    );
-    mel_spec
+    amplitude_to_db(mel_spec, top_db)
 }
 
 fn mel_spectrogram(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
-    let start_time = Instant::now();
     let spectrogram = spectrogram(
         waveform,
         config.n_fft,
@@ -254,62 +247,39 @@ fn mel_spectrogram(config: &MelConfig, waveform: Vec<f32>) -> Vec<Vec<f32>> {
         config.hop_length,
         config.spectrogram_config.onesided,
     );
-    println!("Spectrogram generation time: {:?}", start_time.elapsed());
-
-    let start_time = Instant::now();
-    let frames = spectrogram.len();
     let n_freqs = spectrogram[0].len();
-    let spec_flat: Vec<f32> = spectrogram.into_iter().flatten().collect();
-    let spec_arr = Array2::from_shape_vec((frames, n_freqs), spec_flat).unwrap();
-
-    // Use cached filterbank if available, otherwise compute dynamically
-    let fbanks_arr: Array2<f32> = if let Some(arr) =
-        FILTERBANKS.get(&(config.n_fft, config.sample_rate as u32, config.n_mels))
-    {
-        arr.clone()
-    } else {
-        let n_freqs = config.n_fft / 2 + 1;
-        let fbanks = mel_filter_bank(
-            n_freqs,
-            config.f_min,
-            config.f_max,
-            config.n_mels,
-            config.sample_rate,
-        );
-        let fbanks_flat: Vec<f32> = fbanks.into_iter().flatten().collect();
-        Array2::from_shape_vec((config.n_mels, n_freqs), fbanks_flat).unwrap()
-    };
-    let mel_arr = spec_arr.dot(&fbanks_arr.t());
-
-    // Fuse amplitude→dB conversion
-    let epsilon = 1e-10f32;
-    let result: Vec<Vec<f32>> = mel_arr
-        .mapv(|x| 20.0 * x.max(epsilon).log10())
-        .outer_iter()
-        .map(|row| row.to_vec())
-        .collect();
-    println!(
-        "Mel filtering + dB conversion time: {:?}",
-        start_time.elapsed()
+    let fbanks = mel_filter_bank(
+        n_freqs,
+        config.f_min,
+        config.f_max,
+        config.n_mels,
+        config.sample_rate,
     );
-    result
+    spectrogram
+        .into_par_iter()
+        .map(|spec_row| {
+            (0..config.n_mels)
+                .map(|j| {
+                    spec_row
+                        .iter()
+                        .zip(fbanks.iter())
+                        .map(|(&s, fbank)| s * fbank[j])
+                        .sum()
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn spectrogram(
     waveform: Vec<f32>,
     n_fft: usize,
-    win_length: usize,
-    hop_length: usize,
+    _win_length: usize,
+    _hop_length: usize,
     onesided: bool,
 ) -> Vec<Vec<f32>> {
-    let start_time = Instant::now();
-    // GPU-accelerated FFT
-    let result = gpu_spectrogram(waveform, n_fft, win_length, hop_length, onesided);
-    println!(
-        "Total spectrogram function time: {:?}",
-        start_time.elapsed()
-    );
-    result
+    let spec = gpu_spectrogram(waveform, n_fft, _win_length, _hop_length, onesided);
+    spec
 }
 
 fn mel_filter_bank(
@@ -463,13 +433,10 @@ pub fn plot_mel_spec(
             let val = val_top * (1.0 - mel_frac) + val_bottom * mel_frac;
 
             // Convert to color
-            if val.is_finite() && smin != smax {
-                let norm = ((val - smin) / (smax - smin)).clamp(0.0, 1.0);
-                let idx = (norm * 255.0).round() as usize;
-                image.put_pixel(px, py, Rgb(color_map[idx.min(255)]));
-            } else {
-                image.put_pixel(px, py, Rgb([0, 0, 0])); // fallback for NaNs or constant images
-            }
+            let norm = (val - smin) / (smax - smin + f32::EPSILON);
+            let idx = (norm * 255.0).round().clamp(0.0, 255.0) as usize;
+            let color = color_map[idx];
+            image.put_pixel(px, py, Rgb(color));
         }
     }
 
@@ -533,18 +500,49 @@ pub fn plot_mel_spec_py(
     width_px: u32,
     height_px: u32,
 ) -> PyResult<Py<PyAny>> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+
+    println!(
+        "Starting plot_mel_spec_py with dimensions {}x{}",
+        width_px, height_px
+    );
     let start_time = Instant::now();
+
     let image = plot_mel_spec(mel_spec, cmap, width_px, height_px);
-    println!("plot_mel_spec_py plotting time: {:?}", start_time.elapsed());
+    let plotting_time = start_time.elapsed();
+    println!("plot_mel_spec_py plotting time: {:?}", plotting_time);
 
     let start_time_encoding = Instant::now();
     let result = Python::with_gil(|py| {
-        // Convert image to PNG bytes
-        let mut buffer = Cursor::new(Vec::new());
-        match image.write_to(&mut buffer, image::ImageFormat::Png) {
+        println!(
+            "Starting PNG encoding with buffer size: {} bytes",
+            (width_px * height_px * 3) as usize
+        );
+
+        let start_time_buffer = Instant::now();
+        // Pre-allocate buffer with estimated size
+        let mut buffer = Vec::with_capacity((width_px * height_px * 3) as usize);
+        let buffer_time = start_time_buffer.elapsed();
+        println!("Buffer allocation time: {:?}", buffer_time);
+
+        // Use fast PNG encoding settings
+        let encoder = PngEncoder::new_with_quality(
+            &mut buffer,
+            CompressionType::Fast, // Use fast compression
+            FilterType::NoFilter,  // Disable filtering for speed
+        );
+
+        // Write image data directly
+        let result = encoder.write_image(&image, image.width(), image.height(), ColorType::Rgb8);
+
+        match result {
             Ok(_) => {
-                // Convert to Python bytes object
-                let bytes = PyBytes::new(py, &buffer.into_inner());
+                println!(
+                    "PNG encoding successful, output size: {} bytes",
+                    buffer.len()
+                );
+                let bytes = PyBytes::new(py, &buffer);
                 Ok(bytes.into())
             }
             Err(e) => Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
@@ -553,11 +551,12 @@ pub fn plot_mel_spec_py(
             ))),
         }
     });
-    println!(
-        "plot_mel_spec_py encoding time: {:?}",
-        start_time_encoding.elapsed()
-    );
+    let encoding_time = start_time_encoding.elapsed();
+    println!("plot_mel_spec_py encoding time: {:?}", encoding_time);
     println!("plot_mel_spec_py total time: {:?}", start_time.elapsed());
+    println!("plot_mel_spec_py performance breakdown:");
+    println!("  - Plotting: {:?}", plotting_time);
+    println!("  - Encoding: {:?}", encoding_time);
     result
 }
 
@@ -668,4 +667,29 @@ impl<'py> IntoPyObject<'py> for MelConfig {
         let dict_any = dict.into_pyobject(py)?.into_any();
         Ok(dict_any)
     }
+}
+
+fn amplitude_to_db(amplitudes: Vec<Vec<f32>>, top_db: f32) -> Vec<Vec<f32>> {
+    use rayon::prelude::*;
+    let dbs: Vec<Vec<f32>> = amplitudes
+        .into_par_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|amp| 20.0 * amp.max(1e-10).log10())
+                .collect()
+        })
+        .collect();
+
+    let max_db = dbs
+        .iter()
+        .flat_map(|row| row.iter())
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let clipped: Vec<Vec<f32>> = dbs
+        .into_par_iter()
+        .map(|row| row.into_iter().map(|db| db.max(max_db - top_db)).collect())
+        .collect();
+
+    clipped
 }

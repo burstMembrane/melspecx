@@ -227,12 +227,7 @@ mod tests {
 ///     tuple: (audio_data, sample_rate)
 #[cfg(feature = "python-bindings")]
 #[pyfunction]
-pub fn read_wav(
-    path: String,
-    normalize: Option<bool>,
-    offset: Option<f32>,
-    duration: Option<f32>,
-) -> PyResult<(Vec<f32>, u32)> {
+pub fn read_wav(path: String, normalize: Option<bool>) -> PyResult<(Vec<f32>, u32)> {
     let result = _read_wav(&path, None, None).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read WAV file: {:?}", e))
     })?;
