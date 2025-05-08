@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 #[cfg(feature = "python-bindings")]
 use pyo3::types::PyBytes;
 
-use crate::audio::read_wav;
+use crate::audio::read_audio_file;
 
 use std::io::Cursor;
 
@@ -71,9 +71,9 @@ pub fn mel_spec_from_path(
         ))
     })?;
 
-    let (audio, sr) = read_wav(path, Some(true)).map_err(|e| {
-        error!("Failed to read WAV file: {}", e);
-        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read WAV file: {}", e))
+    let (audio, sr) = read_audio_file(path, Some(true)).map_err(|e| {
+        error!("Failed to read audio file: {}", e);
+        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read audio file: {}", e))
     })?;
 
     info!("Audio read time: {:?}", start_time.elapsed());

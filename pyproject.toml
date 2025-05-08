@@ -12,14 +12,11 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
-dependencies = [
-    "halo>=0.0.31",
-    "numpy>=1.24.4",
-    "typer>=0.15.3",
-]
+dependencies = ["halo>=0.0.31", "numpy>=1.24.4", "typer>=0.15.3"]
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
 
 [project.scripts]
 melspecx = "melspecx.cli:app"
+librosa = "melspecx.librosa_cli:app"
